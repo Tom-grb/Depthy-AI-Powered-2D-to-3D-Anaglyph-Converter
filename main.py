@@ -5,21 +5,29 @@ import os
 import argparse
 from tqdm import tqdm
 import torch.nn.functional as F
+from ai_utils import ImageEnhancer
+from fast_enhance import FastEnhancer
 
 class Converter2Dto3D:
-    def __init__(self, use_gpu=True, model_type="DPT_Large"):
+    def __init__(self, use_gpu=True, model_type="DPT_Large", enhance_mode=None):
         """
         初始化 2D 转 3D 转换器
         
         参数:
-        - use_gpu: 是否使用 GPU 加速 (推荐 True)
-        - model_type: 深度模型类型
-            - "DPT_Large": 质量最高，速度较慢 (推荐)
-            - "DPT_Hybrid": 速度和质量平衡
-            - "MiDaS_small": 速度最快，质量一般
+        - enhance_mode: "hq" (Real-ESRGAN, 慢但清晰), "fast" (FSRCNN, 快), 或 None
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() and use_gpu else "cpu")
         print(f"当前使用设备: {self.device}")
+        
+        # 初始化画质增强器
+        self.enhancer = None
+        if enhance_mode == "hq":
+            print("初始化高清画质增强 (Real-ESRGAN)... 速度较慢") 
+            self.enhancer = ImageEnhancer(use_gpu=use_gpu)
+        elif enhance_mode == "fast":
+            print("初始化快速画质增强 (FSRCNN)... 速度较快")
+            self.enhancer = FastEnhancer(use_gpu=use_gpu)
+            self.enhancer.load_model()
         
         print(f"正在加载深度模型 ({model_type})... 首次运行可能需要下载模型。")
         self.model = torch.hub.load("intel-isl/MiDaS", model_type)
@@ -143,7 +151,7 @@ def chunk_warping(img_tensor, grid):
     # 这种方式可以利用 GPU 并行加速，比手动逐像素循环快得多
     return F.grid_sample(img_tensor, grid, mode='bilinear', padding_mode='border', align_corners=True)
 
-def process_file(file_path, output_path, converter, shift_strength=30):
+def process_file(file_path, output_path, converter, shift_strength=30, upscale_factor=2):
     if not os.path.exists(file_path):
         print(f"文件未找到: {file_path}")
         return
@@ -159,6 +167,20 @@ def process_file(file_path, output_path, converter, shift_strength=30):
         if img is None:
             print(f"读取图片失败: {file_path}")
             return
+            
+        # 0. 画质增强
+        if converter.enhancer:
+            try:
+                # FastEnhancer 不接受 out_scale 参数，默认 x2
+                if hasattr(converter.enhancer, 'model_name') and converter.enhancer.model_name == 'fsrcnn':
+                   img = converter.enhancer.enhance(img)
+                else:
+                   print(f"正在应用 AI 画质增强 (x{upscale_factor})... 这可能需要一些时间")
+                   img = converter.enhancer.enhance(img, out_scale=upscale_factor)
+            except Exception as e:
+                print(f"画质增强失败: {e}")
+                # 继续处理原图
+            print(f"增强后分辨率: {img.shape[1]}x{img.shape[0]}")
             
         h, w = img.shape[:2]
         real_strength = shift_strength * (w / target_scale_width)
@@ -198,19 +220,38 @@ def process_file(file_path, output_path, converter, shift_strength=30):
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
+        # 如果启用了增强，计算新的分辨率
+        out_width, out_height = width, height
+        if converter.enhancer:
+            is_fast = hasattr(converter.enhancer, 'model_name') and converter.enhancer.model_name == 'fsrcnn'
+            if is_fast:
+                print("正在使用 FSRCNN 快速增强 (固定 x2 倍)...")
+                upscale_factor = 2.0
+            else:
+                # 警告: 视频逐帧超分非常慢
+                print("警告: 正在使用 Real-ESRGAN 对视频进行逐帧超分辨率。速度极慢！")
+                
+            out_width = int(width * upscale_factor)
+            out_height = int(height * upscale_factor)
+            
+            # 更新 real_strength 的基准
+            real_strength = shift_strength * (out_width / target_scale_width)
+        else:
+            real_strength = shift_strength * (width / target_scale_width)
+            
         # 优先使用 avc1 (H.264) 编码，兼容性最好。如果失败回退到 mp4v
         try:
             fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
             
             if not out.isOpened():
                 print("提示: avc1 编码器不可用，尝试使用 mp4v 编码...")
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+                out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
         except Exception as e:
             print(f"编码器初始化异常: {e}")
             fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+            out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
 
         if not out.isOpened():
             print("错误: 无法创建视频文件。可能是路径问题或缺少编码器。尝试安装 opencv-python-headless 或检查输出路径。")
@@ -219,13 +260,22 @@ def process_file(file_path, output_path, converter, shift_strength=30):
         
         pbar = tqdm(total=total_frames, unit="frame")
         
-        real_strength = shift_strength * (width / target_scale_width)
-        border_x = int(real_strength) + int(width * 0.02)
+        border_x = int(real_strength) + int(out_width * 0.02)
         
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
+            
+            # 0. AI 增强 
+            if converter.enhancer:
+               try:
+                   if hasattr(converter.enhancer, 'model_name') and converter.enhancer.model_name == 'fsrcnn':
+                       frame = converter.enhancer.enhance(frame)
+                   else:
+                       frame = converter.enhancer.enhance(frame, out_scale=upscale_factor)
+               except Exception as e:
+                   print(f"Frame enhance error: {e}")
                 
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
@@ -234,11 +284,11 @@ def process_file(file_path, output_path, converter, shift_strength=30):
             left_view, right_view = converter.apply_stereo_shift(frame, depth, real_strength)
             
             # 裁剪
-            if border_x > 0 and border_x < width//4:
+            if border_x > 0 and border_x < out_width//4:
                  left_view = left_view[:, border_x:-border_x]
                  right_view = right_view[:, border_x:-border_x]
-                 left_view = cv2.resize(left_view, (width, height))
-                 right_view = cv2.resize(right_view, (width, height))
+                 left_view = cv2.resize(left_view, (out_width, out_height))
+                 right_view = cv2.resize(right_view, (out_width, out_height))
                  
             anaglyph = converter.make_anaglyph(left_view, right_view)
             
@@ -256,10 +306,22 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="2D 图片/视频转红青 3D 工具")
     parser.add_argument("input", help="输入文件路径 (图片或视频)")
     parser.add_argument("--output", help="输出文件路径")
-    parser.add_argument("--strength", type=float, default=25.0, help="立体分离强度 (默认 25，数值越大立体感越强)")
-    parser.add_argument("--model", default="DPT_Large", choices=["DPT_Large", "DPT_Hybrid", "MiDaS_small"], help="使用的深度模型类型")
+    parser.add_argument("--strength", type=float, default=25.0, help="立体分离强度 (默认 25)")
+    parser.add_argument("--model", default="DPT_Large", choices=["DPT_Large", "DPT_Hybrid", "MiDaS_small"], help="深度模型类型")
+    
+    # 画质增强选项
+    parser.add_argument("--enhance", action="store_true", help="启用画质增强 (默认使用快速模式 FSRCNN)")
+    parser.add_argument("--hq", action="store_true", help="启用高质量最慢模式 (Real-ESRGAN)")
+    parser.add_argument("--scale", type=float, default=2.0, help="画质增强缩放倍数 (仅 HQ 模式有效，Fast 模式固定 x2)")
     
     args = parser.parse_args()
+    
+    # Determine enhance mode
+    enhance_mode = None
+    if args.hq:
+        enhance_mode = "hq"
+    elif args.enhance:
+        enhance_mode = "fast"
     
     if not os.path.exists(args.input):
         print(f"未找到输入文件: {args.input}")
@@ -268,7 +330,8 @@ if __name__ == "__main__":
     output = args.output
     if not output:
         name, ext = os.path.splitext(args.input)
-        output = f"{name}_3d{ext}"
+        tag = "_hq_3d" if args.hq else ("_enhanced_3d" if args.enhance else "_3d")
+        output = f"{name}{tag}{ext}"
         
-    converter = Converter2Dto3D(model_type=args.model)
-    process_file(args.input, output, converter, shift_strength=args.strength)
+    converter = Converter2Dto3D(model_type=args.model, enhance_mode=enhance_mode)
+    process_file(args.input, output, converter, shift_strength=args.strength, upscale_factor=args.scale)
