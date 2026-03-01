@@ -289,24 +289,29 @@ def process_file(file_path, output_path, converter, shift_strength=30, save_inte
         out_width, out_height = width, height
         real_strength = shift_strength * (width / target_scale_width)
             
-        # 优先使用 avc1 (H.264) 编码，兼容性最好。如果失败回退到 mp4v
-        try:
-            fourcc = cv2.VideoWriter_fourcc(*'avc1')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
-            
-            if not out.isOpened():
-                print("提示: avc1 编码器不可用，尝试使用 mp4v 编码...")
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
-        except Exception as e:
-            print(f"编码器初始化异常: {e}")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
+        # 尝试初始化视频写入器
+        # 优先使用 mp4v，因为它不需要额外的 openh264 dll，在 Windows 上通常都能用
+        out = None
+        current_codec = 'Unknown'
+        
+        qt_codecs = ['avc1', 'mp4v', 'XVID'] # 尝试列表
+        
+        for codec in qt_codecs:
+            try:
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                temp_out = cv2.VideoWriter(output_path, fourcc, fps, (out_width, out_height))
+                if temp_out.isOpened():
+                    out = temp_out
+                    current_codec = codec
+                    print(f"成功初始化视频编码器: {codec}")
+                    break
+            except Exception as e:
+                continue
 
-        if not out.isOpened():
-            print("错误: 无法创建视频文件。可能是路径问题或缺少编码器。尝试安装 opencv-python-headless 或检查输出路径。")
-            cap.release()
-            return
+        if out is None or not out.isOpened():
+             print("错误: 无法创建视频文件。尝试安装 opencv-python-headless 或检查输出路径。")
+             cap.release()
+             return
         
         pbar = tqdm(total=total_frames, unit="frame")
         
