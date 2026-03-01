@@ -1,51 +1,65 @@
-# 2D to 3D Converter (Red-Cyan Anaglyph)
+# 2D 转 3D 转换器 (红蓝立体 / Red-Cyan Anaglyph)
 
-This tool converts standard 2D images and videos into Red-Cyan 3D anaglyph format using AI depth estimation (MiDaS).
+此工具使用 AI 深度估计 (MiDaS) 将标准 2D 图像和视频转换为红蓝 3D 立体格式。
 
-## Requirements
+## 环境要求 (Requirements)
 
 1.  Python 3.8+
-2.  **Setup Virtual Environment (Recommended):**
-    ```bash
-    # Create virtual environment
+2.  **设置虚拟环境 (推荐):**
+
+    ### Windows (PowerShell)
+    如果你遇到 "无法加载文件...因为在此系统上禁止运行脚本" (UnauthorizedAccess) 的错误，请先运行权限策略命令。
+
+    ```powershell
+    # 1. 创建虚拟环境
     python -m venv venv
     
-    # Activate (Windows)
-    .\venv\Scripts\activate
+    # 2. 允许运行脚本 (解决权限错误)
+    Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
     
-    # Activate (Linux/Mac)
+    # 3. 激活环境 (注意路径中的 .ps1)
+    .\venv\Scripts\Activate.ps1
+    ```
+    *成功激活后，命令行前面会出现 `(venv)` 字样。*
+
+    ### Linux / macOS
+    ```bash
+    python3 -m venv venv
     source venv/bin/activate
     ```
-3.  Install dependencies:
+
+3.  **安装依赖:**
     ```bash
     pip install -r requirements.txt
     ```
-    Note: You should have PyTorch installed with CUDA support if you have a GPU. Visit [pytorch.org](https://pytorch.org/get-started/locally/) for specific install commands if needed. Typically: `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118` (or similar).
+    注意：如果你有 NVIDIA 显卡，建议安装支持 CUDA 的 PyTorch。如果默认安装的版本不支持 GPU，请访问 [pytorch.org](https://pytorch.org/get-started/locally/) 获取特定的安装命令。
+    例如：`pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118`
 
-## Usage
+## 使用方法 (Usage)
 
-### Process an Image
+确保你已经激活了虚拟环境 (命令行前显示 `(venv)`)。
+
+### 处理图片
 ```bash
 python main.py path/to/image.jpg
 ```
 
-### Process a Video
+### 处理视频
 ```bash
 python main.py path/to/video.mp4
 ```
 
-### Options
-*   `--strength`: Adjust the 3D effect strength (Depth). Default is 25. Higher means more "pop out" but risk of eye strain.
+### 选项 (Options)
+*   `--strength`: 调整 3D 效果强度 (深度)。默认值为 25。
+    *   **改进算法说明**: 新版本引入了“零视差平面”算法，让中间物体位于屏幕上，近处出屏，远处入屏，大幅减少重影并提升观看舒适度。
+    *   建议范围: 30 - 60。
     ```bash
-    python main.py image.jpg --strength 40
+    python main.py image.jpg --strength 45
     ```
-*   `--model`: Choose the depth model.
-    *   `DPT_Large` (Default): Best quality, slower.
-    *   `DPT_Hybrid`: Good balance.
-    *   `MiDaS_small`: Fastest, lower quality.
+*   `--save-intermediate`: 保存中间处理结果，包括深度图、左右单眼各视图、以及并排 (Side-by-Side) 视图。
     ```bash
-    python main.py video.mp4 --model MiDaS_small
+    python main.py image.jpg --save-intermediate
     ```
 
-## Output
-The output file will be saved in the same folder with `_3d` appended to the name (e.g., `image_3d.jpg`).
+## 输出 (Output)
+输出文件将保存在同一文件夹中，文件名后附加 `_3d` (例如 `image_3d.jpg`)。

@@ -5,65 +5,110 @@ import os
 import argparse
 from tqdm import tqdm
 import torch.nn.functional as F
-from ai_utils import ImageEnhancer
-from fast_enhance import FastEnhancer
+from torchvision.transforms import Compose, Resize, Normalize, ToTensor
+from PIL import Image
 
 class Converter2Dto3D:
-    def __init__(self, use_gpu=True, model_type="DPT_Large", enhance_mode=None):
+    def __init__(self, use_gpu=True):
         """
         初始化 2D 转 3D 转换器
-        
-        参数:
-        - enhance_mode: "hq" (Real-ESRGAN, 慢但清晰), "fast" (FSRCNN, 快), 或 None
         """
         self.device = torch.device("cuda" if torch.cuda.is_available() and use_gpu else "cpu")
         print(f"当前使用设备: {self.device}")
         
-        # 初始化画质增强器
-        self.enhancer = None
-        if enhance_mode == "hq":
-            print("初始化高清画质增强 (Real-ESRGAN)... 速度较慢") 
-            self.enhancer = ImageEnhancer(use_gpu=use_gpu)
-        elif enhance_mode == "fast":
-            print("初始化快速画质增强 (FSRCNN)... 速度较快")
-            self.enhancer = FastEnhancer(use_gpu=use_gpu)
-            self.enhancer.load_model()
+        # 针对 4GB 显存优化: 使用 Depth Anything V2 (Small)
+        try:
+            print("正在加载深度模型 (Depth-Anything-Small)...")
+            from transformers import AutoImageProcessor, AutoModelForDepthEstimation
+            
+            # 使用 Hugging Face 的 transformers 库加载，避开 GitHub API 限制
+            self.processor = AutoImageProcessor.from_pretrained("LiheYoung/depth-anything-small-hf")
+            self.model = AutoModelForDepthEstimation.from_pretrained("LiheYoung/depth-anything-small-hf")
+            self.model_type = "Depth-Anything-HF"
+            
+        except ImportError:
+            print("缺少 transformers 库。尝试使用 pip install transformers 安装。正在回退到 torch.hub...")
+            try:
+                self.model = torch.hub.load('LiheYoung/depth-anything', 'depth_anything_vits14', source='github')
+                self.model_type = "Depth-Anything-Hub"
+            except Exception as e:
+                 print(f"加载 Depth Anything (Hub) 失败: {e}. 回退到 MiDaS...")
+                 self.model = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
+                 self.model_type = "MiDaS"
+        except Exception as e:
+            print(f"加载 Depth Anything (Transformers) 失败: {e}. 回退到 MiDaS...")
+            try:
+                # 最后的尝试
+                 self.model = torch.hub.load("intel-isl/MiDaS", "DPT_Hybrid")
+                 self.model_type = "MiDaS"
+            except:
+                 self.model = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
+                 self.model_type = "MiDaS"
+
+        self.model.to(self.device).eval()
         
-        print(f"正在加载深度模型 ({model_type})... 首次运行可能需要下载模型。")
-        self.model = torch.hub.load("intel-isl/MiDaS", model_type)
-        self.model.to(self.device)
-        self.model.eval()
-        
-        # 加载 MiDaS 的预处理变换
-        midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
-        if model_type == "DPT_Large" or model_type == "DPT_Hybrid":
+        # 设置预处理变换 (如果不是 HF 模型)
+        if self.model_type == "Depth-Anything-Hub":
+            self.transform = Compose([
+                Resize((518, 518)),
+                ToTensor(),
+                Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+        elif self.model_type == "MiDaS":
+             # MiDaS transforms
+            midas_transforms = torch.hub.load("intel-isl/MiDaS", "transforms")
             self.transform = midas_transforms.dpt_transform
-        else:
-            self.transform = midas_transforms.small_transform
 
     def estimate_depth(self, img_rgb):
         """
         估算图片的深度图
-        
-        输入: numpy 数组 (H, W, 3) RGB 格式
-        输出: 深度图 (H, W)，并归一化到 0-1 之间
         """
-        input_batch = self.transform(img_rgb).to(self.device)
+        h, w = img_rgb.shape[:2]
         
-        with torch.no_grad():
-            prediction = self.model(input_batch)
+        if self.model_type == "Depth-Anything-HF":
+            # Transformers 流程
+            # processor 会自动处理 resize 和 normalize
+            image_pil = Image.fromarray(img_rgb)
+            inputs = self.processor(images=image_pil, return_tensors="pt").to(self.device)
             
-            # 辅助函数: 将预测结果调整回原始分辨率
-            prediction = torch.nn.functional.interpolate(
-                prediction.unsqueeze(1),
-                size=img_rgb.shape[:2],
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                predicted_depth = outputs.predicted_depth
+                
+            # 插值回原尺寸
+            prediction = F.interpolate(
+                predicted_depth.unsqueeze(1),
+                size=(h, w),
                 mode="bicubic",
                 align_corners=False,
             ).squeeze()
+            depth = prediction
             
-        depth = prediction.cpu().numpy()
+        elif self.model_type == "Depth-Anything-Hub":
+            # Hub 流程
+            image_pil = Image.fromarray(img_rgb)
+            img_input = self.transform(image_pil).unsqueeze(0).to(self.device)
+            
+            with torch.no_grad():
+                depth = self.model(img_input)
+                # 插值回原尺寸
+                depth = F.interpolate(depth.unsqueeze(1), (h, w), mode="bicubic", align_corners=False).squeeze()
+        else:
+            # MiDaS 流程
+            input_batch = self.transform(img_rgb).to(self.device)
+            with torch.no_grad():
+                prediction = self.model(input_batch)
+                prediction = F.interpolate(
+                    prediction.unsqueeze(1),
+                    size=img_rgb.shape[:2],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze()
+            depth = prediction
+
+        depth = depth.cpu().numpy()
         
-        # 将深度图归一化到 0 到 1 之间
+        # 归一化深度图 (0-1)
         depth_min = depth.min()
         depth_max = depth.max()
         if depth_max - depth_min > 1e-8:
@@ -90,8 +135,25 @@ class Converter2Dto3D:
         # 视差张量
         disparity = torch.from_numpy(depth).to(self.device) # (H, W)
         
-        # 计算位移量
-        shift_tensor = disparity * shift_amount
+        # --- 优化重影和立体感 ---
+        # 原始: shift = disparity * shift_amount (0 at far, max at near) -> 全部出屏
+        # 改进: 引入汇聚点 (Convergence Plane)。
+        # 让中间深度的物体在屏幕平面 (0 shift)，近处出屏，远处入屏。
+        # 这样人眼对焦更舒服，且能减少单一方向的大位移导致的重影。
+        
+        convergence_point = 0.5  # 0 (远) - 1 (近). 0.5 表示中间深度在屏幕上
+        # 我们希望: 
+        # depth < convergence -> shift 符号 A (入屏)
+        # depth > convergence -> shift 符号 B (出屏)
+        
+        # 稍微非线性调整一下深度，让近处的主体更突出
+        disparity = torch.pow(disparity, 1.2)
+        
+        # 计算带汇聚点的位移
+        # shift > 0: 出屏
+        # shift < 0: 入屏
+        # 增加整体 shift_amount 因为现在分摊到入屏和出屏了
+        shift_tensor = (disparity - convergence_point) * shift_amount * 1.5 
         
         # 生成归一化坐标网格
         grid_y_norm, grid_x_norm = torch.meshgrid(
@@ -151,7 +213,7 @@ def chunk_warping(img_tensor, grid):
     # 这种方式可以利用 GPU 并行加速，比手动逐像素循环快得多
     return F.grid_sample(img_tensor, grid, mode='bilinear', padding_mode='border', align_corners=True)
 
-def process_file(file_path, output_path, converter, shift_strength=30, upscale_factor=2):
+def process_file(file_path, output_path, converter, shift_strength=30, save_intermediate=False):
     if not os.path.exists(file_path):
         print(f"文件未找到: {file_path}")
         return
@@ -168,20 +230,6 @@ def process_file(file_path, output_path, converter, shift_strength=30, upscale_f
             print(f"读取图片失败: {file_path}")
             return
             
-        # 0. 画质增强
-        if converter.enhancer:
-            try:
-                # FastEnhancer 不接受 out_scale 参数，默认 x2
-                if hasattr(converter.enhancer, 'model_name') and converter.enhancer.model_name == 'fsrcnn':
-                   img = converter.enhancer.enhance(img)
-                else:
-                   print(f"正在应用 AI 画质增强 (x{upscale_factor})... 这可能需要一些时间")
-                   img = converter.enhancer.enhance(img, out_scale=upscale_factor)
-            except Exception as e:
-                print(f"画质增强失败: {e}")
-                # 继续处理原图
-            print(f"增强后分辨率: {img.shape[1]}x{img.shape[0]}")
-            
         h, w = img.shape[:2]
         real_strength = shift_strength * (w / target_scale_width)
         
@@ -190,17 +238,35 @@ def process_file(file_path, output_path, converter, shift_strength=30, upscale_f
         # 1. 深度估算
         depth = converter.estimate_depth(img_rgb)
         
+        if save_intermediate:
+            # 保存深度图 (归一化到 0-255)
+            depth_uint8 = (depth * 255).astype(np.uint8)
+            # 使用伪彩色以便于观察
+            depth_colormap = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_MAGMA)
+            depth_path = os.path.splitext(output_path)[0] + "_depth.png"
+            cv2.imwrite(depth_path, depth_colormap)
+            print(f"深度图已保存: {depth_path}")
+        
         # 2. 生成立体视图
         left_view, right_view = converter.apply_stereo_shift(img, depth, real_strength)
         
         # 3. 裁剪边缘伪影 (位移后边缘会有拉伸，需要裁掉)
         # 裁剪量 = 位移量 + 2% 的安全边距
-        border_x = int(real_strength) + int(w * 0.02)
+        border_x = int(abs(real_strength)) + int(w * 0.02)
         if border_x > 0 and border_x < w//4:
             left_view = left_view[:, border_x:-border_x]
             right_view = right_view[:, border_x:-border_x]
             left_view = cv2.resize(left_view, (w, h))
             right_view = cv2.resize(right_view, (w, h))
+            
+        if save_intermediate:
+            base_name = os.path.splitext(output_path)[0]
+            cv2.imwrite(f"{base_name}_left.jpg", left_view)
+            cv2.imwrite(f"{base_name}_right.jpg", right_view)
+            # 保存并排对比图
+            sbs_view = np.hstack((left_view, right_view))
+            cv2.imwrite(f"{base_name}_sbs.jpg", sbs_view)
+            print(f"中间视图已保存: {base_name}_left/right/sbs.jpg")
         
         # 4. 合成红青图
         anaglyph = converter.make_anaglyph(left_view, right_view)
@@ -220,24 +286,8 @@ def process_file(file_path, output_path, converter, shift_strength=30, upscale_f
         fps = cap.get(cv2.CAP_PROP_FPS)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # 如果启用了增强，计算新的分辨率
         out_width, out_height = width, height
-        if converter.enhancer:
-            is_fast = hasattr(converter.enhancer, 'model_name') and converter.enhancer.model_name == 'fsrcnn'
-            if is_fast:
-                print("正在使用 FSRCNN 快速增强 (固定 x2 倍)...")
-                upscale_factor = 2.0
-            else:
-                # 警告: 视频逐帧超分非常慢
-                print("警告: 正在使用 Real-ESRGAN 对视频进行逐帧超分辨率。速度极慢！")
-                
-            out_width = int(width * upscale_factor)
-            out_height = int(height * upscale_factor)
-            
-            # 更新 real_strength 的基准
-            real_strength = shift_strength * (out_width / target_scale_width)
-        else:
-            real_strength = shift_strength * (width / target_scale_width)
+        real_strength = shift_strength * (width / target_scale_width)
             
         # 优先使用 avc1 (H.264) 编码，兼容性最好。如果失败回退到 mp4v
         try:
@@ -267,16 +317,6 @@ def process_file(file_path, output_path, converter, shift_strength=30, upscale_f
             if not ret:
                 break
             
-            # 0. AI 增强 
-            if converter.enhancer:
-               try:
-                   if hasattr(converter.enhancer, 'model_name') and converter.enhancer.model_name == 'fsrcnn':
-                       frame = converter.enhancer.enhance(frame)
-                   else:
-                       frame = converter.enhancer.enhance(frame, out_scale=upscale_factor)
-               except Exception as e:
-                   print(f"Frame enhance error: {e}")
-                
             frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             
             # 使用深度模型处理每一帧
@@ -305,23 +345,13 @@ def process_file(file_path, output_path, converter, shift_strength=30, upscale_f
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="2D 图片/视频转红青 3D 工具")
     parser.add_argument("input", help="输入文件路径 (图片或视频)")
+    parser.add_argument("--strength", type=float, default=25.0, help="立体分离强度 (建议 30-50)")
     parser.add_argument("--output", help="输出文件路径")
-    parser.add_argument("--strength", type=float, default=25.0, help="立体分离强度 (默认 25)")
-    parser.add_argument("--model", default="DPT_Large", choices=["DPT_Large", "DPT_Hybrid", "MiDaS_small"], help="深度模型类型")
     
-    # 画质增强选项
-    parser.add_argument("--enhance", action="store_true", help="启用画质增强 (默认使用快速模式 FSRCNN)")
-    parser.add_argument("--hq", action="store_true", help="启用高质量最慢模式 (Real-ESRGAN)")
-    parser.add_argument("--scale", type=float, default=2.0, help="画质增强缩放倍数 (仅 HQ 模式有效，Fast 模式固定 x2)")
+    # 保存中间结果
+    parser.add_argument("--save-intermediate", action="store_true", help="保存中间结果 (深度图、左右视图)")
     
     args = parser.parse_args()
-    
-    # Determine enhance mode
-    enhance_mode = None
-    if args.hq:
-        enhance_mode = "hq"
-    elif args.enhance:
-        enhance_mode = "fast"
     
     if not os.path.exists(args.input):
         print(f"未找到输入文件: {args.input}")
@@ -330,8 +360,7 @@ if __name__ == "__main__":
     output = args.output
     if not output:
         name, ext = os.path.splitext(args.input)
-        tag = "_hq_3d" if args.hq else ("_enhanced_3d" if args.enhance else "_3d")
-        output = f"{name}{tag}{ext}"
+        output = f"{name}_3d{ext}"
         
-    converter = Converter2Dto3D(model_type=args.model, enhance_mode=enhance_mode)
-    process_file(args.input, output, converter, shift_strength=args.strength, upscale_factor=args.scale)
+    converter = Converter2Dto3D()
+    process_file(args.input, output, converter, shift_strength=args.strength, save_intermediate=args.save_intermediate)
