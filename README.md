@@ -2,6 +2,21 @@
 
 此工具使用 AI 深度估计将标准 2D 图像和视频转换为红蓝 3D 立体格式。
 
+## 效果展示 (Gallery)
+
+以下图片由本工具一键生成。**请佩戴红蓝 3D 眼镜观看。**
+
+### 3D 效果
+![3D Result](img/img_3d.jpg)
+
+### 深度图可视化 (Depth Map)
+![Depth Map](img/img_3d_depth.png)
+
+### 原始图片 vs Side-by-Side (并排)
+| Original | Side-by-Side |
+| :---: | :---: |
+| ![Original](img/img.jpg) | ![SBS](img/img_3d_sbs.jpg) |
+
 ## 环境要求 (Requirements)
 
 1.  Python 3.8+
